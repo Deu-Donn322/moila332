@@ -80,7 +80,7 @@ Configurer le token Telegram :
 
 Remplacez la variable token dans dreambot.py par votre propre token Telegram :
 
-token = "VOTRE_TOKEN_ICI"
+token = "7506566781:AAGnBOfXpMgil4ZafjWjKzMlF6j8VG2mZxk"
 
 
 
