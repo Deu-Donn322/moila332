@@ -1,0 +1,1240 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import json
+import time
+import random
+import sqlite3
+from datetime import datetime
+from typing import List, Dict, Any, Callable, Tuple, Optional
+
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+
+def escape_md(text: str) -> str:
+    """
+    Escapes Markdown-sensitive characters to prevent Telegram formatting issues.
+    """
+    if not text:
+        return text
+    replacements = {
+        "*": r"\*",
+        "_": r"\_",
+        "`": r"\`",
+        "[": r"\[",
+        "]": r"\]",
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text
+
+def now_str() -> str:
+    """
+    Returns the current timestamp as a formatted string.
+    """
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ------------------------------------------------------------
+# Non-Repeating Selector (User-based, via SQLite)
+# ------------------------------------------------------------
+
+class NonRepeatingSelector:
+    def __init__(self, db: sqlite3.Connection):
+        """
+        Initializes the selector with a SQLite database connection.
+        """
+        self.db = db
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """
+        Creates the selections table and index if they don't exist.
+        """
+        try:
+            cur = self.db.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS selections (
+                    user_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    used_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_selections ON selections(user_id, category, used_at)")
+            self.db.commit()
+        except sqlite3.Error as e:
+            print(f"Database schema creation error: {e}")
+
+    def record(self, user_id: int, category: str, item_key: str) -> None:
+        """
+        Records a selected item for a user and category.
+        """
+        try:
+            cur = self.db.cursor()
+            cur.execute("INSERT INTO selections (user_id, category, item_key, used_at) VALUES (?, ?, ?, ?)",
+                        (user_id, category, item_key, now_str()))
+            self.db.commit()
+        except sqlite3.Error as e:
+            print(f"Error recording selection: {e}")
+
+    def recent_keys(self, user_id: int, category: str, limit_count: int) -> List[str]:
+        """
+        Retrieves the most recent item keys for a user and category.
+        """
+        try:
+            cur = self.db.cursor()
+            cur.execute("""
+                SELECT item_key FROM selections
+                WHERE user_id=? AND category=?
+                ORDER BY used_at DESC
+                LIMIT ?
+            """, (user_id, category, limit_count))
+            rows = cur.fetchall()
+            return [r[0] for r in rows]
+        except sqlite3.Error as e:
+            print(f"Error fetching recent keys: {e}")
+            return []
+
+    def select_one(self, user_id: int, category: str, items: List[Any], key_fn: Callable[[Any], str], recent_window: Optional[int] = None) -> Any:
+        """
+        Selects one item, avoiding the last 'recent_window' items used by the user.
+        Falls back to full list if no non-recent items are available.
+        """
+        if not items:
+            raise ValueError("select_one: items list is empty")
+        if recent_window is None:
+            recent_window = max(1, len(items) - 1)
+
+        recent = set(self.recent_keys(user_id, category, recent_window))
+        candidates = [x for x in items if key_fn(x) not in recent]
+
+        if not candidates:
+            candidates = items[:]
+
+        choice = random.choice(candidates)
+        self.record(user_id, category, key_fn(choice))
+        return choice
+
+    def select_many(self, user_id: int, category: str, items: List[Any], key_fn: Callable[[Any], str], k: int, recent_window: Optional[int] = None) -> List[Any]:
+        """
+        Selects k items, avoiding recent items where possible.
+        """
+        if k <= 0 or not items:
+            return []
+        if k >= len(items):
+            randomized = items[:]
+            random.shuffle(randomized)
+            for it in randomized:
+                self.record(user_id, category, key_fn(it))
+            return randomized
+
+        selected: List[Any] = []
+        seen_keys = set()
+        for _ in range(k):
+            remaining = [x for x in items if key_fn(x) not in seen_keys]
+            if not remaining:
+                break
+            choice = self.select_one(user_id, category, remaining, key_fn, recent_window=recent_window)
+            sk = key_fn(choice)
+            if sk in seen_keys:
+                continue
+            seen_keys.add(sk)
+            selected.append(choice)
+        return selected
+
+# ------------------------------------------------------------
+# Data (Extensible) - Expanded for broader coverage
+# ------------------------------------------------------------
+
+SYMBOLS: Dict[str, Dict[str, Any]] = {
+    "eau": {
+        "synonymes": ["rivière", "mer", "océan", "pluie", "torrent", "lacs", "étang", "inondation"],
+        "interpretations": [
+            {
+                "interpretation": "L'eau symbolise souvent la purification, le renouveau spirituel, ou la vie en Christ. Jésus a promis l'eau vive à ceux qui cherchent Sa présence.",
+                "verset": "Jean 7:37-38",
+                "priere": "Seigneur Jésus, purifie mon cœur et donne-moi de boire à ta source inépuisable. Amen."
+            },
+            {
+                "interpretation": "Une eau agitée ou trouble peut refléter des perturbations émotionnelles ou spirituelles, mais Christ apporte la paix sur les tempêtes.",
+                "verset": "Marc 4:39",
+                "priere": "Jésus, parle à mes tempêtes intérieures et établis ta paix durable. Amen."
+            },
+            {
+                "interpretation": "Une eau claire évoque la clarté spirituelle, la vérité révélée par la Parole de Dieu, et une invitation à la foi pure.",
+                "verset": "Psaume 119:105",
+                "priere": "Père, éclaire mon chemin par ta Parole et rends mes pensées limpides. Amen."
+            },
+            {
+                "interpretation": "L'eau en abondance peut symboliser une effusion de l'Esprit Saint, apportant bénédiction et renouveau.",
+                "verset": "Ézéchiel 36:25-27",
+                "priere": "Seigneur, répands ton Esprit sur moi pour un renouveau profond. Amen."
+            },
+        ]
+    },
+    "voler": {
+        "synonymes": ["s'envoler", "envol", "ailes", "planer", "ciel"],
+        "interpretations": [
+            {
+                "interpretation": "Voler traduit une élévation spirituelle, une liberté en Christ, ou une aspiration à s'approcher de Dieu.",
+                "verset": "Ésaïe 40:31",
+                "priere": "Seigneur, élève-moi au-dessus des fardeaux et renouvelle ma force. Amen."
+            },
+            {
+                "interpretation": "Prendre de la hauteur peut refléter un appel à adopter la perspective divine sur les défis de la vie.",
+                "verset": "Colossiens 3:2",
+                "priere": "Père, attache mon cœur aux réalités d'en haut et non à celles d'en bas. Amen."
+            },
+            {
+                "interpretation": "Voler peut aussi indiquer une délivrance des chaînes terrestres, invitant à la confiance en Dieu.",
+                "verset": "Psaume 55:6-8",
+                "priere": "Donne des ailes à mon âme pour chercher ta paix. Amen."
+            },
+        ]
+    },
+    "maison": {
+        "synonymes": ["foyer", "habitation", "demeure", "logis", "bâtiment"],
+        "interpretations": [
+            {
+                "interpretation": "La maison représente souvent le cœur ou l'âme, un lieu où Dieu désire habiter comme temple du Saint-Esprit.",
+                "verset": "1 Corinthiens 6:19-20",
+                "priere": "Saint-Esprit, sanctifie ma vie pour qu'elle te soit consacrée. Amen."
+            },
+            {
+                "interpretation": "Une maison peut symboliser la stabilité, la famille, ou l'alliance avec Dieu, mais aussi un besoin de fondations solides.",
+                "verset": "Josué 24:15",
+                "priere": "Seigneur, que ma maison serve l'Éternel avec fidélité. Amen."
+            },
+            {
+                "interpretation": "Une maison en désordre peut refléter un besoin de restauration intérieure ou de réconciliation.",
+                "verset": "Matthieu 7:24-25",
+                "priere": "Père, bâtis ma vie sur le roc de ta Parole. Amen."
+            },
+        ]
+    },
+    "serpent": {
+        "synonymes": ["vipère", "reptile", "cobra"],
+        "interpretations": [
+            {
+                "interpretation": "Le serpent peut symboliser la tentation ou une lutte spirituelle contre les forces du mal.",
+                "verset": "1 Pierre 5:8-9",
+                "priere": "Seigneur, affermis-moi afin que je résiste aux ruses du malin. Amen."
+            },
+            {
+                "interpretation": "Il peut aussi représenter la prudence et la sagesse dans un monde complexe.",
+                "verset": "Matthieu 10:16",
+                "priere": "Donne-moi sagesse et simplicité selon ton Esprit. Amen."
+            },
+            {
+                "interpretation": "Un serpent vaincu peut symboliser la victoire en Christ sur le péché et l'ennemi.",
+                "verset": "Luc 10:19",
+                "priere": "Jésus, donne-moi l'autorité pour marcher dans ta victoire. Amen."
+            },
+        ]
+    },
+    "voiture": {
+        "synonymes": ["auto", "véhicule", "conduire", "transport"],
+        "interpretations": [
+            {
+                "interpretation": "La voiture reflète souvent le chemin de vie, le voyage spirituel, ou la direction que prend votre âme.",
+                "verset": "Jean 14:6",
+                "priere": "Guide mes pas et dirige ma route, Seigneur. Amen."
+            },
+            {
+                "interpretation": "Conduire peut indiquer un besoin de contrôle ou un appel à laisser Dieu guider votre vie.",
+                "verset": "Proverbes 3:5-6",
+                "priere": "Je m'appuie sur toi, dirige mes sentiers. Amen."
+            },
+            {
+                "interpretation": "Une voiture en panne peut symboliser des obstacles sur votre chemin, nécessitant la prière et la patience.",
+                "verset": "Psaume 37:7",
+                "priere": "Seigneur, enseigne-moi à attendre ta délivrance. Amen."
+            },
+        ]
+    },
+    "argent": {
+        "synonymes": ["richesse", "or", "finances", "billets", "monnaie"],
+        "interpretations": [
+            {
+                "interpretation": "L'argent peut représenter une tentation matérielle, mais aussi la provision divine pour ceux qui font confiance à Dieu.",
+                "verset": "1 Timothée 6:10",
+                "priere": "Détache mon cœur de l'avidité et apprends-moi la confiance. Amen."
+            },
+            {
+                "interpretation": "Une gestion fidèle des ressources matérielles honore Dieu et reflète la foi.",
+                "verset": "Luc 16:10-11",
+                "priere": "Rends-moi fidèle dans les petites choses comme dans les grandes. Amen."
+            },
+            {
+                "interpretation": "L'abondance ou le manque d'argent peut refléter un appel à chercher d'abord le royaume de Dieu.",
+                "verset": "Matthieu 6:33",
+                "priere": "Père, que ton royaume soit ma priorité. Amen."
+            },
+        ]
+    },
+    "mariage": {
+        "synonymes": ["noces", "époux", "épouse", "alliances", "union"],
+        "interpretations": [
+            {
+                "interpretation": "Le mariage symbolise l'alliance spirituelle avec Christ, l'Époux de l'Église, ou une relation sacrée.",
+                "verset": "Ésaïe 54:5",
+                "priere": "Unis mon cœur à toi dans une alliance fidèle. Amen."
+            },
+            {
+                "interpretation": "Il peut refléter l'unité, la fidélité, ou un engagement renouvelé envers Dieu ou les autres.",
+                "verset": "Éphésiens 5:25-33",
+                "priere": "Apprends-moi l'amour qui se donne et se sacrifie. Amen."
+            },
+            {
+                "interpretation": "Un mariage troublé peut indiquer un besoin de réconciliation ou de restauration dans une relation.",
+                "verset": "Colossiens 3:13-14",
+                "priere": "Seigneur, aide-moi à pardonner et à aimer comme toi. Amen."
+            },
+        ]
+    },
+    "enfant": {
+        "synonymes": ["bébé", "fille", "garçon", "petit", "nouveau-né"],
+        "interpretations": [
+            {
+                "interpretation": "Un enfant symbolise la simplicité de la foi, l'innocence, ou un nouveau départ en Christ.",
+                "verset": "Marc 10:14-15",
+                "priere": "Donne-moi un cœur simple et confiant. Amen."
+            },
+            {
+                "interpretation": "Il peut représenter une croissance spirituelle ou une nouvelle bénédiction à venir.",
+                "verset": "1 Pierre 2:2-3",
+                "priere": "Fais-moi croître par la Parole vivante. Amen."
+            },
+            {
+                "interpretation": "Un enfant en danger peut refléter une vulnérabilité intérieure nécessitant la protection divine.",
+                "verset": "Psaume 91:11",
+                "priere": "Seigneur, envoie tes anges pour me garder. Amen."
+            },
+        ]
+    },
+    "animal": {
+        "synonymes": ["bête", "chien", "chat", "cheval", "lion", "oiseau", "loup"],
+        "interpretations": [
+            {
+                "interpretation": "Les animaux rappellent la providence de Dieu, qui veille sur toute sa création.",
+                "verset": "Matthieu 6:26",
+                "priere": "Apprends-moi à reposer dans ta providence. Amen."
+            },
+            {
+                "interpretation": "Chaque animal peut symboliser une qualité (force, douceur, vigilance) ou une leçon spirituelle.",
+                "verset": "Proverbes 30:24-28",
+                "priere": "Inspire-moi par la sagesse de ta création. Amen."
+            },
+            {
+                "interpretation": "Un animal menaçant peut représenter une lutte spirituelle ou un défi à surmonter par la foi.",
+                "verset": "Éphésiens 6:10-11",
+                "priere": "Revêts-moi de ton armure pour résister. Amen."
+            },
+        ]
+    },
+    "chat": {
+        "synonymes": ["chats", "félin"],
+        "interpretations": [
+            {
+                "interpretation": "Le chat symbolise souvent la vigilance, l'indépendance, ou un appel à discerner les influences subtiles.",
+                "verset": "Matthieu 25:13",
+                "priere": "Rends-moi vigilant et prêt. Amen."
+            },
+            {
+                "interpretation": "Il peut aussi refléter un équilibre entre solitude et besoin de communion avec Dieu ou les autres.",
+                "verset": "Psaume 84:10",
+                "priere": "Attire-moi dans ta présence et ta maison. Amen."
+            },
+        ]
+    },
+    "oiseau": {
+        "synonymes": ["oiseaux", "hirondelle", "moineau", "aigle", "colombe"],
+        "interpretations": [
+            {
+                "interpretation": "L'oiseau évoque la liberté spirituelle, l'élévation vers Dieu, ou la paix de l'Esprit.",
+                "verset": "Proverbes 26:2",
+                "priere": "Libère-moi de toute oppression inutile. Amen."
+            },
+            {
+                "interpretation": "S'envoler symbolise un désir de transcender les épreuves terrestres pour chercher Dieu.",
+                "verset": "Psaume 55:6-8",
+                "priere": "Donne des ailes à mon âme pour te chercher. Amen."
+            },
+            {
+                "interpretation": "Un oiseau blessé peut refléter une fragilité intérieure, nécessitant la guérison divine.",
+                "verset": "Psaume 147:3",
+                "priere": "Seigneur, guéris mes blessures profondes. Amen."
+            },
+        ]
+    },
+    "arbre": {
+        "synonymes": ["arbres", "racines", "forêt", "branches"],
+        "interpretations": [
+            {
+                "interpretation": "L'arbre symbolise l'enracinement dans la foi et la fécondité spirituelle par la Parole.",
+                "verset": "Psaume 1:3",
+                "priere": "Plante-moi près de l'eau vive de ta Parole. Amen."
+            },
+            {
+                "interpretation": "Il représente aussi les saisons de la vie et la croissance dans la volonté de Dieu.",
+                "verset": "Ecclésiaste 3:1-2",
+                "priere": "Apprends-moi à discerner les temps. Amen."
+            },
+            {
+                "interpretation": "Un arbre sec peut indiquer un besoin de renouveau spirituel ou de reconnection avec Dieu.",
+                "verset": "Jérémie 17:7-8",
+                "priere": "Seigneur, fais-moi prospérer en toi, même dans la sécheresse. Amen."
+            },
+        ]
+    },
+    "soleil": {
+        "synonymes": ["lumière", "rayon", "jour", "soleils"],
+        "interpretations": [
+            {
+                "interpretation": "Le soleil représente la lumière de Christ, dissipant les ténèbres et apportant la vérité.",
+                "verset": "Jean 8:12",
+                "priere": "Lumière du monde, éclaire mon chemin. Amen."
+            },
+            {
+                "interpretation": "Il symbolise aussi la guérison, la justice, et la présence réconfortante de Dieu.",
+                "verset": "Malachie 4:2",
+                "priere": "Fais lever sur moi un soleil de justice. Amen."
+            },
+            {
+                "interpretation": "Un soleil éclatant peut refléter la gloire de Dieu ou une révélation divine.",
+                "verset": "Psaume 84:11",
+                "priere": "Seigneur, sois mon soleil et mon bouclier. Amen."
+            },
+        ]
+    },
+    "lune": {
+        "synonymes": ["clair de lune", "nuit", "croissant", "lunes"],
+        "interpretations": [
+            {
+                "interpretation": "La lune reflète la lumière de Dieu, nous appelant à être des témoins de Christ.",
+                "verset": "Matthieu 5:14-16",
+                "priere": "Fais de moi un reflet fidèle de ta lumière. Amen."
+            },
+            {
+                "interpretation": "Elle marque les saisons spirituelles et les cycles de renouvellement.",
+                "verset": "Genèse 1:16-18",
+                "priere": "Que tes temps réglent mes pas. Amen."
+            },
+            {
+                "interpretation": "Une lune obscure peut symboliser une période de doute, nécessitant la foi pour avancer.",
+                "verset": "Psaume 23:4",
+                "priere": "Seigneur, guide-moi même dans l'ombre. Amen."
+            },
+        ]
+    },
+    "mort": {
+        "synonymes": ["décès", "funérailles", "cimetière", "mourir", "mourrir", "tombe"],
+        "interpretations": [
+            {
+                "interpretation": "La mort dans un rêve peut symboliser la fin d'un cycle de vie, ouvrant la voie à un renouveau spirituel en Christ.",
+                "verset": "2 Corinthiens 5:17",
+                "priere": "Fais de moi une nouvelle créature en Christ. Amen."
+            },
+            {
+                "interpretation": "Elle invite souvent à abandonner l'ancien pour revêtir l'homme nouveau, en se confiant à Dieu.",
+                "verset": "Éphésiens 4:22-24",
+                "priere": "Renouvelle mon être intérieur par ton Esprit. Amen."
+            },
+            {
+                "interpretation": "La mort peut refléter une peur ou une transition majeure, mais Dieu promet la vie éternelle à ceux qui croient.",
+                "verset": "Jean 11:25-26",
+                "priere": "Jésus, tu es la résurrection et la vie; fortifie ma foi. Amen."
+            },
+            {
+                "interpretation": "Elle peut aussi être un appel au repentir ou à une réévaluation des priorités spirituelles face à la fragilité de la vie.",
+                "verset": "Psaumes 118:17",
+                "priere": "Je ne mourrai pas, je vivrai, et je raconterai les œuvres de l'Éternel. Amen."
+            },
+            {
+                "interpretation": "Dans un contexte de peur, la mort symbolise parfois une lutte spirituelle, mais Dieu est plus fort que toute fin.",
+                "verset": "1 Corinthiens 15:54-55",
+                "priere": "Seigneur, où est ta victoire, ô mort ? Fortifie-moi par ton triomphe. Amen."
+            },
+        ]
+    },
+    "maladie": {
+        "synonymes": ["cancer", "tumeur", "atteint", "malade", "affliction", "fièvre", "douleur"],
+        "interpretations": [
+            {
+                "interpretation": "La maladie, comme le cancer, peut symboliser une lutte spirituelle ou une affliction qui ronge l'âme, appelant à la guérison par la foi.",
+                "verset": "Psaumes 103:3",
+                "priere": "Seigneur, guéris toutes mes maladies et pardonne mes iniquités. Amen."
+            },
+            {
+                "interpretation": "Elle reflète parfois les conséquences d'un monde déchu, mais Dieu offre la rédemption et la guérison physique ou spirituelle.",
+                "verset": "Jacques 5:14-15",
+                "priere": "Seigneur, que la prière de la foi sauve le malade et le relève. Amen."
+            },
+            {
+                "interpretation": "Une maladie dans un rêve peut indiquer un fardeau émotionnel ou spirituel, invitant à chercher la paix en Christ.",
+                "verset": "Éphésiens 6:12",
+                "priere": "Père, aide-moi dans cette lutte spirituelle contre les forces du mal. Amen."
+            },
+            {
+                "interpretation": "Elle peut être un appel à se tourner vers Dieu pour la force et la guérison face aux épreuves.",
+                "verset": "Exode 15:26",
+                "priere": "Éternel, tu es mon guérisseur; écoute mes cris et guéris-moi. Amen."
+            },
+            {
+                "interpretation": "Une maladie grave peut symboliser un besoin urgent de restauration et de confiance en la providence divine.",
+                "verset": "Psaume 30:2-3",
+                "priere": "Seigneur, tu m'as guéri et soutenu; restaure-moi par ta grâce. Amen."
+            },
+        ]
+    },
+    "feu": {
+        "synonymes": ["flamme", "incendie", "brasier", "brûler"],
+        "interpretations": [
+            {
+                "interpretation": "Le feu symbolise la présence de Dieu, la purification, ou un jugement spirituel qui purifie l'âme.",
+                "verset": "Hébreux 12:29",
+                "priere": "Dieu de feu, purifie mon cœur par ton Esprit. Amen."
+            },
+            {
+                "interpretation": "Un feu destructeur peut refléter une épreuve ou une attaque spirituelle, mais Dieu protège ceux qui se confient en Lui.",
+                "verset": "Daniel 3:25",
+                "priere": "Seigneur, marche avec moi dans les flammes de l'épreuve. Amen."
+            },
+            {
+                "interpretation": "Le feu peut aussi représenter le zèle ou une passion renouvelée pour la mission de Dieu.",
+                "verset": "Luc 12:49",
+                "priere": "Jésus, allume en moi un feu pour ta gloire. Amen."
+            },
+        ]
+    },
+    "ciel": {
+        "synonymes": ["nuages", "étoiles", "paradis", "firmament"],
+        "interpretations": [
+            {
+                "interpretation": "Le ciel symbolise la présence divine, l'éternité, ou un appel à lever les yeux vers Dieu.",
+                "verset": "Psaume 19:1",
+                "priere": "Seigneur, que tes cieux proclament ta gloire dans ma vie. Amen."
+            },
+            {
+                "interpretation": "Un ciel clair peut refléter l'espoir et la promesse de la vie éternelle en Christ.",
+                "verset": "Jean 14:2-3",
+                "priere": "Jésus, prépare-moi une place dans ta maison éternelle. Amen."
+            },
+            {
+                "interpretation": "Un ciel orageux peut indiquer des troubles, mais aussi l'intervention imminente de Dieu.",
+                "verset": "Psaume 18:13-14",
+                "priere": "Seigneur, parle dans la tempête et guide-moi. Amen."
+            },
+        ]
+    },
+    "route": {
+        "synonymes": ["chemin", "sentier", "voyage", "parcours"],
+        "interpretations": [
+            {
+                "interpretation": "Une route symbolise le chemin de vie, où Jésus est le guide ultime.",
+                "verset": "Jean 14:6",
+                "priere": "Jésus, sois mon chemin, ma vérité et ma vie. Amen."
+            },
+            {
+                "interpretation": "Une route difficile peut refléter des défis, mais Dieu promet de diriger vos pas.",
+                "verset": "Proverbes 3:5-6",
+                "priere": "Seigneur, aplanis mes sentiers selon ta volonté. Amen."
+            },
+            {
+                "interpretation": "Une route inconnue peut indiquer un appel à la foi et à l'abandon à Dieu.",
+                "verset": "Hébreux 11:8",
+                "priere": "Père, guide-moi par la foi, même dans l'inconnu. Amen."
+            },
+        ]
+    },
+    "sang": {
+        "synonymes": ["sanglant", "hémorragie", "plaie"],
+        "interpretations": [
+            {
+                "interpretation": "Le sang symbolise souvent le sacrifice de Christ, la rédemption, ou la vie spirituelle.",
+                "verset": "Hébreux 9:14",
+                "priere": "Seigneur, purifie-moi par le sang précieux de Jésus. Amen."
+            },
+            {
+                "interpretation": "Il peut aussi refléter une blessure émotionnelle ou spirituelle nécessitant la guérison divine.",
+                "verset": "Psaume 147:3",
+                "priere": "Dieu, guéris mes plaies par ta grâce. Amen."
+            },
+            {
+                "interpretation": "Le sang peut représenter une alliance ou un engagement sacré avec Dieu.",
+                "verset": "Exode 24:8",
+                "priere": "Seigneur, scelle mon cœur dans ton alliance. Amen."
+            },
+        ]
+    },
+}
+
+VERSETS_ENCOURAGEMENT: List[Dict[str, str]] = [
+    {"verset": "Jérémie 29:11", "texte": "Car je connais les projets que j'ai formés sur vous, dit l'Éternel, projets de paix et non de malheur, afin de vous donner un avenir et de l'espérance.", "key": "Jer29:11"},
+    {"verset": "Philippiens 4:13", "texte": "Je puis tout par celui qui me fortifie.", "key": "Phi4:13"},
+    {"verset": "Psaume 23:1-3", "texte": "L'Éternel est mon berger: je ne manquerai de rien. Il me fait reposer dans de verts pâturages, Il me dirige près des eaux paisibles.", "key": "Ps23:1-3"},
+    {"verset": "Romains 8:28", "texte": "Nous savons, du reste, que toutes choses concourent au bien de ceux qui aiment Dieu.", "key": "Rom8:28"},
+    {"verset": "Ésaïe 41:10", "texte": "Ne crains rien, car je suis avec toi; Ne promène pas des regards inquiets, car je suis ton Dieu; Je te fortifie.", "key": "Isa41:10"},
+    {"verset": "Psaume 27:1", "texte": "L'Éternel est ma lumière et mon salut: De qui aurais-je crainte? L'Éternel est le soutien de ma vie: De qui aurais-je peur?", "key": "Ps27:1"},
+    {"verset": "Psaume 34:5", "texte": "Quand on tourne vers lui les regards, on est rayonnant de joie, Et le visage ne se couvre pas de honte.", "key": "Ps34:5"},
+    {"verset": "Jean 14:27", "texte": "Je vous laisse la paix, je vous donne ma paix. Je ne vous donne pas comme le monde donne. Que votre cœur ne se trouble point.", "key": "Jn14:27"},
+    {"verset": "Proverbes 3:5-6", "texte": "Confie-toi en l'Éternel de tout ton cœur, Et ne t'appuie pas sur ta sagesse; Reconnais-le dans toutes tes voies, Et il aplanira tes sentiers.", "key": "Prov3:5-6"},
+    {"verset": "Psaume 91:1-2", "texte": "Celui qui demeure sous l'abri du Très-Haut Repose à l'ombre du Tout-Puissant. Je dis à l'Éternel: Mon refuge et ma forteresse, Mon Dieu en qui je me confie!", "key": "Ps91:1-2"},
+    {"verset": "Psaumes 103:2-3", "texte": "Que mon âme bénisse l'Éternel! Qu'elle n'oublie aucun de ses bienfaits! C'est lui qui pardonne toutes tes iniquités, Qui guérit toutes tes maladies.", "key": "Ps103:2-3"},
+    {"verset": "Jean 11:25", "texte": "Jésus lui dit: Je suis la résurrection et la vie. Celui qui croit en moi vivra, quand même il serait mort.", "key": "Jn11:25"},
+    {"verset": "Psaumes 118:17", "texte": "Je ne mourrai pas, je vivrai, Et je raconterai les œuvres de l'Éternel.", "key": "Ps118:17"},
+    {"verset": "Psaume 30:2-3", "texte": "Éternel, mon Dieu! J'ai crié à toi, et tu m'as guéri. Éternel, tu as fait remonter mon âme du séjour des morts, Tu m'as fait revivre loin de ceux qui descendent dans la fosse.", "key": "Ps30:2-3"},
+    {"verset": "Ésaïe 53:5", "texte": "Mais il était blessé pour nos péchés, Brisé pour nos iniquités; Le châtiment qui nous donne la paix est tombé sur lui, Et c'est par ses meurtrissures que nous sommes guéris.", "key": "Isa53:5"},
+]
+
+PRIERE_PAR_EMOTION: Dict[str, List[str]] = {
+    "peur": [
+        "Seigneur Jésus, tu dis: N'ayez pas peur, c'est moi. Verse ta paix dans mon cœur et chasse toute crainte. Amen.",
+        "Père, je me réfugie en toi; que ta présence dissipe mes peurs et m'entoure de ton amour. Amen.",
+        "Dieu de paix, garde mes pensées en Christ et affermis-moi face à l'incertitude. Amen.",
+        "Seigneur, face à la peur de la mort, rappelle-moi que tu es la résurrection et la vie. Amen.",
+        "Père céleste, enveloppe-moi de ton courage et guide-moi dans l'ombre de la vallée. Amen.",
+    ],
+    "inquietude": [
+        "Je dépose mes soucis à tes pieds; apprends-moi la confiance jour après jour. Amen.",
+        "Seigneur, délivre-moi de l'angoisse et donne-moi ta paix qui surpasse toute intelligence. Amen.",
+        "Père fidèle, je choisis de ne pas m'inquiéter, mais de prier avec foi. Amen.",
+        "Dieu, calme mon cœur inquiet et guide-moi vers tes promesses. Amen.",
+    ],
+    "tristesse": [
+        "Tu es proche de ceux qui ont le cœur brisé; console-moi et relève-moi par ton amour. Amen.",
+        "Esprit de Dieu, remplace mes cendres par une huile de joie et restaure mon âme. Amen.",
+        "Jésus, guéris mon cœur brisé et renouvelle mon espérance en toi. Amen.",
+        "Seigneur, dans ma tristesse, sois ma joie et ma force. Amen.",
+    ],
+    "colere": [
+        "Seigneur, rends-moi lent à la colère et riche en bonté, selon ton cœur. Amen.",
+        "Jésus, règne dans mon cœur et chasse toute irritation par ta paix. Amen.",
+        "Père, apprends-moi la douceur et la maîtrise de soi par ton Esprit. Amen.",
+    ],
+    "doute": [
+        "Augmente ma foi, Seigneur; je choisis de croire malgré l'incertitude. Amen.",
+        "Dieu fidèle, fortifie ma confiance en tes promesses éternelles. Amen.",
+        "Saint-Esprit, éclaire mes pas quand la route est floue et confuse. Amen.",
+    ],
+    "espoir": [
+        "Seigneur, ravive mon espérance par ta Parole vivante et éternelle. Amen.",
+        "Père, fais briller ton espoir dans mon cœur comme une lumière dans la nuit. Amen.",
+        "Jésus, ancre mon âme dans l'espérance de ta résurrection. Amen.",
+    ],
+    "confusion": [
+        "Seigneur, apporte la clarté à mon esprit et guide-moi par ta vérité. Amen.",
+        "Père, dissipe ma confusion et révèle ta volonté dans ce rêve. Amen.",
+        "Esprit Saint, ordonne mes pensées selon ta sagesse divine. Amen.",
+    ],
+    "generale": [
+        "Seigneur, révèle-moi le sens profond de ce rêve et conduis-moi dans ta volonté. Amen.",
+        "Père, éclaire mon esprit et affermis mon cœur dans la foi chaque jour. Amen.",
+        "Dieu vivant, parle-moi et dirige mes pas selon ta Parole éternelle. Amen.",
+        "Seigneur, dans les épreuves de la vie ou des rêves, sois mon rocher et ma guérison. Amen.",
+        "Jésus, guide-moi par ton Esprit pour comprendre tes messages cachés. Amen.",
+    ],
+}
+
+CONSEILS_SPIRITUELS: List[str] = [
+    "Méditez ce rêve devant Dieu et notez ce qu'il met sur votre cœur pour plus de clarté.",
+    "Priez spécifiquement pour la partie du rêve qui vous a marqué ou troublé.",
+    "Lisez un passage biblique relié aux symboles ou émotions aperçus dans le rêve.",
+    "Partagez ce rêve avec un mentor spirituel digne de confiance pour un discernement partagé.",
+    "Tenez un journal de rêves pour suivre l'évolution des messages que Dieu vous envoie.",
+    "Recherchez la paix: la voix de Dieu apporte toujours clarté et douceur à l'âme.",
+    "Veillez à obéir aux petites impulsions de l'Esprit dans votre vie quotidienne.",
+    "Examinez vos émotions: elles peuvent révéler des désirs profonds ou des luttes intérieures.",
+    "Demandez à Dieu un signe de confirmation dans la Parole pour guider vos pas.",
+    "Louez Dieu: la louange aligne le cœur et dissipe la crainte ou le doute.",
+    "Pratiquez le repos et le silence devant Dieu pour entendre Sa voix plus clairement.",
+    "Écartez ce qui trouble: simplifiez votre vie pour mieux discerner la volonté divine.",
+    "Intercédez pour une personne vue dans le rêve, si cela semble approprié.",
+    "Recherchez l'unité et la réconciliation dans vos relations, si le rêve y fait allusion.",
+    "Prenez un temps de jeûne bref pour écouter Dieu avec plus d'intensité.",
+    "Réexaminez vos priorités à la lumière du rêve et de la Parole de Dieu.",
+    "Notez les couleurs, objets ou thèmes récurrents et cherchez leur sens biblique.",
+    "Remerciez Dieu pour ce qu'Il a déjà éclairé en vous à travers ce rêve.",
+    "Demandez sagesse et discernement chaque matin pour comprendre les messages divins.",
+    "Soyez patient: certaines révélations se dévoilent avec le temps et la prière.",
+    "Confiez vos peurs de maladie ou de mort à Dieu, en cherchant Sa paix.",
+    "Cherchez la guérison spirituelle et physique par la foi et la communauté.",
+    "Méditez sur les promesses de vie éternelle pour surmonter les craintes.",
+    "Ancrez votre cœur dans l'espérance de la résurrection et de la vie en Christ.",
+]
+
+INTRO_TEMPLATES = [
+    "🌟 INTERPRÉTATION BIBLIQUE DE VOTRE RÊVE 🌟\n",
+    "✨ Lecture spirituelle approfondie de votre rêve ✨\n",
+    "🔍 Analyse biblique détaillée et discernement spirituel 🔍\n",
+    "🕊️ Révélation divine à travers votre rêve 🕊️\n",
+]
+
+MESSAGE_SPIRITUEL_TEMPLATES = [
+    "Le Seigneur parle souvent par les rêves, comme avec Joseph et Daniel. Recevez cette interprétation avec un cœur ouvert à Sa paix.",
+    "Dieu utilise les rêves pour attirer notre attention, nous guider, ou révéler Ses desseins. Approchez ce message avec foi.",
+    "Les rêves sont un langage de l'Esprit; écoutez avec humilité pour découvrir ce que Dieu veut vous enseigner.",
+    "Même dans les rêves troublants, Dieu offre espoir, guérison et direction. Confiez-vous à Lui.",
+    "Ce rêve peut être une invitation divine à approfondir votre relation avec Dieu et à chercher Sa volonté.",
+]
+
+CONCLUSION_TEMPLATES = [
+    "Priez et méditez: le Saint-Esprit confirmera et dirigera vos pas avec douceur et clarté.",
+    "Gardez ce rêve devant Dieu, cherchez Sa volonté, et avancez dans Sa paix jour après jour.",
+    "Que la paix de Christ garde votre cœur et vous guide à travers les messages de ce rêve.",
+    "Dieu est votre guérisseur et votre refuge; confiez-Lui vos craintes et marchez dans Sa lumière.",
+    "Continuez à chercher Dieu dans la prière; Il révèle Ses vérités au temps fixé.",
+]
+
+SEPARATOR_CHOICES = ["─", "—", "·", "·", "━"]
+
+# ------------------------------------------------------------
+# Main Bot Class
+# ------------------------------------------------------------
+
+class DreamBot:
+    def __init__(self, token: str, db_path: str = "dreambot.db"):
+        """
+        Initializes the Telegram bot with the provided token and database path.
+        """
+        try:
+            self.bot = telebot.TeleBot(token, parse_mode='Markdown')
+            self.db = sqlite3.connect(db_path, check_same_thread=False)
+            self.selector = NonRepeatingSelector(self.db)
+            self.user_states: Dict[int, str] = {}
+            self._ensure_schema()
+            self._setup_handlers()
+        except Exception as e:
+            print(f"Bot initialization error: {e}")
+            raise
+
+    def _ensure_schema(self) -> None:
+        """
+        Creates the dreams table and index if they don't exist.
+        """
+        try:
+            cur = self.db.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dreams (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    dream_text TEXT NOT NULL,
+                    interpretation_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_dreams_user ON dreams(user_id, created_at DESC)")
+            self.db.commit()
+        except sqlite3.Error as e:
+            print(f"Database schema creation error: {e}")
+
+    def _setup_handlers(self) -> None:
+        """
+        Sets up all Telegram command and message handlers.
+        """
+        @self.bot.message_handler(commands=['start'])
+        def start_command(message):
+            user_id = message.from_user.id
+            username = message.from_user.first_name or "ami"
+            welcome_text = (
+                "🔮 *Bienvenue dans le Bot d'Interprétation Biblique des Rêves* 🔮\n\n"
+                f"Bonjour {escape_md(username)} ! Décrivez-moi votre rêve, même le plus complexe, et je vous offrirai une interprétation biblique détaillée, variée et sans répétition.\n\n"
+                "*Commandes utiles:*\n"
+                "/aide — Guide pour une meilleure utilisation\n"
+                "/versets — Versets d'encouragement variés\n"
+                "/prieres — Prières adaptées et non répétitives\n"
+                "/historique [page] — Consultez votre historique de rêves\n\n"
+                "Ou utilisez les boutons ci-dessous pour commencer."
+            )
+            keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+            keyboard.add(KeyboardButton("📝 Interpréter un rêve"))
+            keyboard.add(KeyboardButton("📖 Versets d'encouragement"))
+            keyboard.add(KeyboardButton("🙏 Prières spéciales"))
+            keyboard.add(KeyboardButton("📚 Mon historique"))
+            keyboard.add(KeyboardButton("ℹ️ Aide"))
+            self.bot.reply_to(message, welcome_text, reply_markup=keyboard)
+            self.user_states[user_id] = "ready"
+
+        @self.bot.message_handler(commands=['aide'])
+        def help_command(message):
+            help_text = (
+                "*📚 GUIDE D'UTILISATION* 📚\n\n"
+                "• Envoyez une description détaillée de votre rêve (ex: 'J'ai rêvé que...')\n"
+                "• Le bot analyse les symboles, émotions, et le contexte pour une interprétation biblique approfondie\n"
+                "• Les réponses sont variées grâce à un système anti-répétition\n"
+                "• Consultez votre historique avec /historique [page]\n\n"
+                "*Conseils:*\n"
+                "— Décrivez les émotions, couleurs, objets, personnes, lieux, ou actions\n"
+                "— Plus de détails = interprétation plus riche et précise\n"
+                "— Si ce n'est pas un rêve, précisez-le ou consultez un pasteur\n"
+            )
+            self.bot.reply_to(message, help_text)
+
+        @self.bot.message_handler(commands=['versets'])
+        def versets_command(message):
+            user_id = message.from_user.id
+            verset = self.selector.select_one(
+                user_id,
+                "verset:encouragement",
+                VERSETS_ENCOURAGEMENT,
+                key_fn=lambda v: v["key"]
+            )
+            sep = random.choice(SEPARATOR_CHOICES) * 40
+            text = (
+                "*📖 VERSET D'ENCOURAGEMENT* 📖\n\n"
+                f"*{escape_md(verset['verset'])}*\n"
+                f"_{escape_md(verset['texte'])}_\n\n"
+                f"{sep}\n"
+                "Prenez un moment pour méditer ce verset et prier pour sa révélation dans votre vie."
+            )
+            self.bot.reply_to(message, text)
+
+        @self.bot.message_handler(commands=['prieres'])
+        def prieres_command(message):
+            user_id = message.from_user.id
+            category = random.choice(list(PRIERE_PAR_EMOTION.keys()))
+            options = PRIERE_PAR_EMOTION[category]
+            priere = self.selector.select_one(
+                user_id,
+                f"priere:{category}",
+                options,
+                key_fn=lambda p: p
+            )
+            self.bot.reply_to(message, f"*🙏 Prière pour vous:*\n{escape_md(priere)}")
+
+        @self.bot.message_handler(commands=['historique'])
+        def history_command(message):
+            user_id = message.from_user.id
+            page = 1
+            parts = message.text.strip().split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                page = max(1, int(parts[1]))
+            page_size = 10
+            offset = (page - 1) * page_size
+
+            try:
+                cur = self.db.cursor()
+                cur.execute("""
+                    SELECT dream_text, interpretation_text, created_at
+                    FROM dreams
+                    WHERE user_id=?
+                    ORDER BY id DESC
+                    LIMIT ? OFFSET ?
+                """, (user_id, page_size, offset))
+                rows = cur.fetchall()
+            except sqlite3.Error as e:
+                self.bot.reply_to(message, f"Erreur lors de la récupération de l'historique: {e}")
+                return
+
+            if not rows:
+                self.bot.reply_to(message, "📚 Aucun rêve enregistré à cette page. Envoyez un rêve pour commencer.")
+                return
+
+            sep = random.choice(SEPARATOR_CHOICES) * 40
+            lines = ["*📚 HISTORIQUE DE VOS RÊVES* 📚\n"]
+            for idx, (dream_text, _interp, created_at) in enumerate(rows, start=1 + offset):
+                preview = dream_text[:120] + ("…" if len(dream_text) > 120 else "")
+                lines.append(f"*🔮 #{idx}* — {escape_md(created_at)}\n_{escape_md(preview)}_\n{sep}")
+
+            lines.append(f"\nUtilisez `/historique {page+1}` pour la page suivante.")
+            self.bot.reply_to(message, "\n\n".join(lines))
+
+        @self.bot.message_handler(func=lambda m: m.text == "📝 Interpréter un rêve")
+        def interpret_dream_button(message):
+            self.user_states[message.from_user.id] = "waiting_for_dream"
+            self.bot.reply_to(
+                message,
+                "🌙 Décrivez-moi votre rêve en détail.\n"
+                "*Exemple:* 'J'ai rêvé que je volais au-dessus d'une mer agitée, puis je suis entré dans une maison lumineuse...'\n"
+                "Incluez émotions, lieux, personnes, ou objets pour une interprétation plus précise."
+            )
+
+        @self.bot.message_handler(func=lambda m: m.text == "📖 Versets d'encouragement")
+        def versets_button(message):
+            versets_command(message)
+
+        @self.bot.message_handler(func=lambda m: m.text == "🙏 Prières spéciales")
+        def prieres_button(message):
+            prieres_command(message)
+
+        @self.bot.message_handler(func=lambda m: m.text == "📚 Mon historique")
+        def history_button(message):
+            history_command(message)
+
+        @self.bot.message_handler(func=lambda m: m.text == "ℹ️ Aide")
+        def help_button(message):
+            help_command(message)
+
+        @self.bot.message_handler(func=lambda m: True, content_types=['text'])
+        def handle_any_text(message):
+            user_id = message.from_user.id
+            state = self.user_states.get(user_id, "ready")
+            if state == "waiting_for_dream" or True:
+                self._process_dream(message)
+                self.user_states[user_id] = "ready"
+
+    # --------------------------------------------------------
+    # Core: Dream Processing - Enhanced for universal and detailed interpretation
+    # --------------------------------------------------------
+
+    def _detect_emotion(self, text: str) -> Optional[str]:
+        """
+        Detects emotions in the dream text based on keywords.
+        """
+        low = text.lower()
+        emotions = {
+            "peur": ["peur", "effray", "terrifi", "angoiss", "crainte", "mourrir", "mort", "cancer", "tombe", "décès"],
+            "inquietude": ["inqui", "souci", "stress", "anxieu", "tension", "nerveux"],
+            "tristesse": ["triste", "pleur", "désespoir", "deprim", "chagrin", "souffrance"],
+            "colere": ["colère", "fâch", "rage", "irrit", "agacé", "frustré"],
+            "doute": ["doute", "incert", "confus", "perdu", "hésit", "indécis"],
+            "espoir": ["espoir", "joie", "lumière", "guéri", "sauvé", "libéré"],
+            "confusion": ["confus", "perdu", "flou", "étrange", "bizarre", "incompréhensible"],
+        }
+        for emo, keys in emotions.items():
+            if any(k in low for k in keys):
+                return emo
+        return None
+
+    def _tokenize_words(self, text: str) -> List[str]:
+        """
+        Tokenizes text into words, handling accented characters and common typos.
+        """
+        text = text.lower().replace("mourrir", "mourir").replace("bientot", "bientôt")
+        return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'-]+", text)
+
+    def _find_symbols(self, text: str) -> List[str]:
+        """
+        Identifies symbols in the dream text by matching against SYMBOLS dictionary.
+        """
+        words = set(self._tokenize_words(text))
+        found: List[str] = []
+        for sym, data in SYMBOLS.items():
+            keys = {sym.lower()}
+            keys.update({k.lower() for k in data.get("synonymes", [])})
+            if any(k in words for k in keys) or any(k in text.lower() for k in keys):
+                found.append(sym)
+        return list(set(found))  # Remove duplicates
+
+    def _select_symbol_interpretations(self, user_id: int, symbols: List[str]) -> List[Tuple[str, Dict[str, str]]]:
+        """
+        Selects up to 5 distinct symbols and their non-recent interpretations.
+        """
+        if not symbols:
+            return []
+        max_symbols = min(5, len(symbols))
+        k = random.randint(2, max_symbols) if len(symbols) > 1 else len(symbols)
+        random.shuffle(symbols)
+        picked_symbols = symbols[:k]
+
+        results: List[Tuple[str, Dict[str, str]]] = []
+        for sym in picked_symbols:
+            interp_list = SYMBOLS[sym]["interpretations"]
+            choice = self.selector.select_one(
+                user_id,
+                f"symbole:{sym}",
+                interp_list,
+                key_fn=lambda d: f"{d['verset']}|{d['interpretation'][:30]}"
+            )
+            results.append((sym, choice))
+        return results
+
+    def _select_encouragement_verse(self, user_id: int, emotion: Optional[str] = None) -> Dict[str, str]:
+        """
+        Selects a non-recent encouragement verse, prioritizing those matching the detected emotion.
+        """
+        if emotion in ["peur", "tristesse"]:
+            priority_verses = [
+                v for v in VERSETS_ENCOURAGEMENT
+                if v["key"] in ["Ps103:2-3", "Jn11:25", "Ps118:17", "Ps30:2-3", "Isa53:5"]
+            ]
+            if priority_verses:
+                return self.selector.select_one(
+                    user_id,
+                    "verset:encouragement",
+                    priority_verses,
+                    key_fn=lambda v: v["key"]
+                )
+        return self.selector.select_one(
+            user_id,
+            "verset:encouragement",
+            VERSETS_ENCOURAGEMENT,
+            key_fn=lambda v: v["key"]
+        )
+
+    def _select_conseils(self, user_id: int, emotion: Optional[str] = None) -> List[str]:
+        """
+        Selects 4 to 8 non-recent spiritual advice items, prioritizing those matching the emotion.
+        """
+        k = random.randint(4, 8)
+        if emotion in ["peur", "tristesse"]:
+            priority_conseils = [
+                c for c in CONSEILS_SPIRITUELS
+                if any(kw in c.lower() for kw in ["peur", "maladie", "mort", "guérison", "espérance"])
+            ]
+            if priority_conseils:
+                return self.selector.select_many(
+                    user_id,
+                    "conseil",
+                    priority_conseils,
+                    key_fn=lambda c: c,
+                    k=min(k, len(priority_conseils))
+                )
+        return self.selector.select_many(
+            user_id,
+            "conseil",
+            CONSEILS_SPIRITUELS,
+            key_fn=lambda c: c,
+            k=k
+        )
+
+    def _select_templates(self, user_id: int) -> Tuple[str, str, str, str]:
+        """
+        Selects non-recent intro, message, conclusion templates, and a random separator.
+        """
+        intro = self.selector.select_one(user_id, "tpl:intro", INTRO_TEMPLATES, key_fn=lambda s: s)
+        msg = self.selector.select_one(user_id, "tpl:message", MESSAGE_SPIRITUEL_TEMPLATES, key_fn=lambda s: s)
+        conc = self.selector.select_one(user_id, "tpl:conclusion", CONCLUSION_TEMPLATES, key_fn=lambda s: s)
+        sep = random.choice(SEPARATOR_CHOICES) * 40
+        return intro, msg, conc, sep
+
+    def _select_priere_personnalisee(self, user_id: int, text: str) -> str:
+        """
+        Selects a non-recent prayer based on detected emotion or general category.
+        """
+        emo = self._detect_emotion(text) or "generale"
+        options = PRIERE_PAR_EMOTION[emo]
+        return self.selector.select_one(user_id, f"priere:{emo}", options, key_fn=lambda p: p)
+
+    def _generate_fallback_interpretation(self, text: str, emotion: Optional[str]) -> str:
+        """
+        Generates a detailed interpretation when no specific symbols are detected.
+        """
+        words_count = len(self._tokenize_words(text))
+        base = "Bien que ce rêve ne contienne pas de symboles clairement identifiables, il semble porter un message spirituel important. "
+        if emotion == "peur":
+            base += "Il peut refléter des craintes profondes, peut-être liées à des incertitudes ou des épreuves comme la maladie ou la mort. Dieu vous invite à vous appuyer sur Sa force et Sa promesse de vie éternelle. Méditez sur Sa présence qui surpasse toute peur."
+        elif emotion == "tristesse":
+            base += "Il semble exprimer une douleur ou une perte intérieure. Dieu est proche des cœurs brisés et promet de restaurer votre joie par Son amour. Cherchez Sa consolation dans la prière."
+        elif emotion == "espoir":
+            base += "Ce rêve pourrait refléter un désir d'espérance ou de renouveau. Dieu vous appelle à fixer vos yeux sur Ses promesses et à marcher dans Sa lumière."
+        elif emotion == "confusion":
+            base += "Il peut indiquer un besoin de clarté ou de direction. Dieu est un Dieu d'ordre; cherchez Sa sagesse à travers la prière et Sa Parole."
+        else:
+            base += "Ce rêve pourrait refléter un moment de réflexion ou une invitation à approfondir votre relation avec Dieu. Considérez les émotions et le contexte pour discerner Son message."
+
+        base += f" Le Seigneur utilise souvent les rêves pour révéler des vérités cachées ou pour préparer votre cœur à Ses plans. Prenez du temps pour méditer et prier, en demandant la guidance de l'Esprit Saint."
+        return base
+
+    def _build_detailed_interpretation(self, symbol_items: List[Tuple[str, Dict[str, str]]], text: str, emotion: Optional[str]) -> str:
+        """
+        Builds a detailed narrative interpretation by combining symbols, context, and emotion.
+        """
+        words_count = len(self._tokenize_words(text))
+        if not symbol_items:
+            return self._generate_fallback_interpretation(text, emotion)
+
+        detail = "Ce rêve semble tisser une histoire spirituelle riche, où plusieurs éléments s'entrelacent pour révéler un message divin : "
+        for i, (sym, info) in enumerate(symbol_items):
+            detail += f"le symbole *{sym}* ({info['interpretation'].lower()[:-1]})"
+            if i < len(symbol_items) - 2:
+                detail += ", "
+            elif i == len(symbol_items) - 2:
+                detail += " et "
+            else:
+                detail += ". "
+
+        detail += "\n\nDans son ensemble, ce rêve pourrait indiquer une période de transition, de purification, ou de confrontation avec des défis intérieurs ou extérieurs. "
+        if emotion == "peur":
+            detail += "Face à la peur ou à l'incertitude, comme peut-être une maladie ou une fin, Dieu vous rappelle qu'Il est votre refuge et votre force. Il vous invite à Lui confier vos craintes et à marcher dans Sa paix."
+        elif emotion == "tristesse":
+            detail += "Dans la tristesse ou le deuil, Dieu se tient près de vous, prêt à guérir votre cœur brisé et à vous envelopper de Son amour consolateur."
+        elif emotion == "espoir":
+            detail += "Ce rêve reflète un élan d'espérance, une invitation à fixer vos yeux sur les promesses éternelles de Dieu et à avancer avec confiance."
+        elif emotion == "confusion":
+            detail += "Face à la confusion, ce rêve vous appelle à chercher la clarté divine à travers la prière et la méditation de la Parole."
+        else:
+            detail += "Ce rêve semble vous appeler à un renouveau spirituel, à une écoute attentive de la voix de Dieu, et à un alignement avec Sa volonté."
+
+        detail += "\n\nLe Seigneur utilise ces images pour parler à votre cœur, vous préparant peut-être à une nouvelle saison, une guérison, ou une révélation de Sa gloire. Prenez du temps pour prier et méditer sur ces symboles, en demandant à l'Esprit Saint de vous guider vers une compréhension plus profonde."
+        return detail
+
+    def _build_interpretation(self, user_id: int, dream_text: str) -> str:
+        """
+        Builds a formatted, detailed interpretation of the dream with symbols, context, verses, prayers, and advice.
+        """
+        intro, message_spirituel, conclusion, sep = self._select_templates(user_id)
+        symbols_found = self._find_symbols(dream_text)
+        symbol_items = self._select_symbol_interpretations(user_id, symbols_found)
+        emotion = self._detect_emotion(dream_text)
+
+        lines: List[str] = []
+        lines.append(intro)
+        lines.append(f"📅 *Analyse:* {escape_md(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n")
+        lines.append(sep)
+
+        # Summary
+        lines.append("*📖 Résumé du rêve:*\n")
+        summary = dream_text.strip()
+        if len(summary) > 350:
+            summary = summary[:350] + "…"
+        lines.append(f"_{escape_md(summary)}_\n")
+        lines.append(sep)
+
+        # Spiritual Message
+        lines.append("*🌙 Message spirituel:*\n")
+        lines.append(f"{escape_md(message_spirituel)}\n")
+        lines.append(sep)
+
+        # Symbols - Detailed listing
+        if symbol_items:
+            lines.append("*🔍 Symboles bibliques identifiés:*\n")
+            for sym, info in symbol_items:
+                lines.append(f"• *{escape_md(sym.upper())}*\n")
+                lines.append(f"  *Signification:* {escape_md(info['interpretation'])}\n")
+                lines.append(f"  *📖 Verset:* {escape_md(info['verset'])}\n")
+                lines.append(f"  *🙏 Prière:* {escape_md(info['priere'])}\n")
+            lines.append(sep)
+        else:
+            lines.append("*🔍 Symboles bibliques:*\n")
+            lines.append("Aucun symbole spécifique n'a été clairement détecté. Cependant, chaque rêve peut porter un message divin. Considérez les émotions, le contexte, et les détails pour discerner la voix de Dieu.\n")
+            lines.append(sep)
+
+        # Contextual Analysis - New detailed section
+        lines.append("*💭 Analyse contextuelle:*\n")
+        detailed_interp = self._build_detailed_interpretation(symbol_items, dream_text, emotion)
+        lines.append(f"{escape_md(detailed_interp)}\n")
+        lines.append(sep)
+
+        # General Interpretation - Enhanced for depth
+        words_count = len(self._tokenize_words(dream_text))
+        general_pool = [
+            "Ce rêve vous invite à approfondir votre relation avec Dieu, en cherchant Sa guidance à travers la prière et Sa Parole, surtout face aux défis actuels.",
+            "Il semble marquer une saison de transformation intérieure, où l'Esprit de Dieu travaille pour vous renouveler et vous fortifier.",
+            "Ce rêve peut refléter des luttes intérieures ou extérieures, mais Jésus promet la paix et la victoire à ceux qui se confient en Lui.",
+            "Votre âme aspire à une croissance spirituelle, à une connexion plus profonde avec Dieu, et à une foi renouvelée.",
+            "Ce rêve pourrait signaler un besoin de guérison émotionnelle ou spirituelle, avec un appel à chercher la présence consolatrice de Dieu.",
+            "Dieu vous parle à travers ce rêve pour réaligner vos priorités, vous préparant à une nouvelle étape dans Sa volonté.",
+            "Ce rêve est une invitation à écouter la voix douce de l'Esprit, qui apporte clarté, paix, et direction dans les moments d'incertitude.",
+            "Il peut refléter une lutte ou une épreuve, mais Dieu vous assure de Sa présence et de Son plan rédempteur pour votre vie.",
+        ]
+        index = min(words_count // 8, len(general_pool) - 1)  # Adjusted for sensitivity
+        lines.append("*🌟 Interprétation générale:*\n")
+        lines.append(f"{escape_md(general_pool[index])}\n")
+        lines.append(sep)
+
+        # Encouragement Verse
+        verset = self._select_encouragement_verse(user_id, emotion)
+        lines.append("*📖 Verset d'encouragement:*\n")
+        lines.append(f"*{escape_md(verset['verset'])}*\n_{escape_md(verset['texte'])}_\n")
+        lines.append(sep)
+
+        # Personalized Prayer
+        priere = self._select_priere_personnalisee(user_id, dream_text)
+        lines.append("*🙏 Prière personnalisée:*\n")
+        lines.append(f"{escape_md(priere)}\n")
+        lines.append(sep)
+
+        # Spiritual Advice
+        conseils = self._select_conseils(user_id, emotion)
+        lines.append("*💡 Conseils spirituels:*\n")
+        for c in conseils:
+            lines.append(f"• {escape_md(c)}")
+        lines.append(sep)
+
+        # Conclusion
+        lines.append("*🕊️ Conclusion:*\n")
+        lines.append(f"{escape_md(conclusion)}\n")
+        lines.append("🔮 Utilisez /historique pour revoir vos rêves ou envoyez un nouveau rêve pour une autre analyse.\n")
+        return "\n".join(lines)
+
+    def _save_dream(self, user_id: int, dream_text: str, interpretation: str) -> None:
+        """
+        Saves the dream and its interpretation to the database.
+        """
+        try:
+            cur = self.db.cursor()
+            cur.execute(
+                "INSERT INTO dreams (user_id, dream_text, interpretation_text, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, dream_text, interpretation, now_str())
+            )
+            self.db.commit()
+        except sqlite3.Error as e:
+            print(f"Error saving dream: {e}")
+
+    def _process_dream(self, message) -> None:
+        """
+        Processes a user's dream, generates an interpretation, and saves it.
+        Checks if it seems like a dream; otherwise, suggests rephrasing.
+        """
+        user_id = message.from_user.id
+        text = message.text.strip()
+        if len(text) < 10:
+            self.bot.reply_to(
+                message,
+                "⚠️ Décrivez votre rêve plus en détail (au moins quelques phrases) pour une interprétation précise."
+            )
+            return
+
+        # Check if it's a dream description
+        lower_text = text.lower()
+        dream_keywords = ["rêve", "rêvais", "rêvé", "songe", "vision", "nuit", "dormir"]
+        if not any(kw in lower_text for kw in dream_keywords):
+            self.bot.reply_to(
+                message,
+                "⚠️ Cela ne semble pas être une description de rêve. Veuillez préciser si c'est un rêve (ex: 'J'ai rêvé que...') ou reformulez. Si c'est une préoccupation personnelle, priez et consultez un pasteur ou un mentor spirituel."
+            )
+            return
+
+        processing = self.bot.reply_to(
+            message,
+            "🔮 Analyse en cours… ⏳ Merci de patienter quelques instants."
+        )
+        time.sleep(random.uniform(0.8, 2.0))
+
+        interpretation = self._build_interpretation(user_id, text)
+
+        try:
+            self.bot.delete_message(message.chat.id, processing.message_id)
+        except Exception:
+            pass
+
+        self.bot.reply_to(message, interpretation)
+        self._save_dream(user_id, text, interpretation)
+
+    def run(self) -> None:
+        """
+        Starts the bot's polling loop.
+        """
+        print("🔮 Bot démarré. Appuyez Ctrl+C pour arrêter.")
+        try:
+            self.bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            print(f"Erreur de polling: {e}")
+            time.sleep(5)
+            self.run()
+
+# ------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------
+
+def main():
+    """
+    Main function to initialize and run the bot with the provided token.
+    """
+    token = "7506566781:AAGnBOfXpMgil4ZafjWjKzMlF6j8VG2mZxk"
+    if not token:
+        print("❌ TELEGRAM_TOKEN manquant.")
+        return
+    try:
+        bot = DreamBot(token)
+        bot.run()
+    except Exception as e:
+        print(f"Erreur lors du démarrage du bot: {e}")
+
+if __name__ == "__main__":
+    main()
